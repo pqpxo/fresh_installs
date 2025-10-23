@@ -1,160 +1,147 @@
 #!/usr/bin/env bash
-# install-docker-linux.sh
-# Purpose: Install the latest Docker Engine on Ubuntu or Debian using Docker's official repository
-# Usage examples:
-#   curl -fsSL https://raw.githubusercontent.com/pqpxo/fresh_installs/main/install-docker-ubuntu.sh | bash
-#   bash install-docker-linux.sh
+# Install Docker Engine and Docker Compose on Ubuntu
+# Also adds a user to the docker group to run docker without sudo
 #
-# Options:
-#   --force          proceed even if distro detection is unusual
-#   --no-enable      install but do not enable the docker service
-#   --no-start       install but do not start the docker service
-#   --add-user USER  add USER to the docker group after install
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/you/repo/main/install-docker.sh | bash -s -- --user sam
+#   or
+#   wget -qO- https://raw.githubusercontent.com/you/repo/main/install-docker.sh | bash -s -- --user sam
+#
+# Flags:
+#   --user USERNAME    Target user to add to the docker group. Defaults to the invoking non-root user if available, otherwise root.
 
 set -euo pipefail
 
-FORCE=0
-NO_ENABLE=0
-NO_START=0
-ADD_USER=""
+log() { printf "%s\n" "[install-docker] $*"; }
+fail() { printf "%s\n" "[install-docker] ERROR: $*" >&2; exit 1; }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --force) FORCE=1; shift ;;
-    --no-enable) NO_ENABLE=1; shift ;;
-    --no-start) NO_START=1; shift ;;
-    --add-user) ADD_USER="${2:-}"; shift 2 ;;
-    *) echo "[!] Unknown option: $1" >&2; exit 2 ;;
-  esac
-done
-
-if [[ "${EUID}" -ne 0 ]]; then
-  SUDO="sudo"
-else
-  SUDO=""
-fi
-
-log() { printf "%s\n" "[+] $*"; }
-err() { printf "%s\n" "[!] $*" >&2; }
-have() { command -v "$1" >/dev/null 2>&1; }
-
-# Detect OS
-if [[ -r /etc/os-release ]]; then
+# Require Ubuntu
+if [ -r /etc/os-release ]; then
   . /etc/os-release
 else
-  err "/etc/os-release not found. Cannot determine OS."
-  exit 1
+  fail "Cannot read /etc/os-release to detect OS."
 fi
 
-DIST_ID="${ID:-}"
-DIST_LIKE="${ID_LIKE:-}"
-CODENAME="${VERSION_CODENAME:-}"
-ARCH="$($SUDO dpkg --print-architecture)"
+if [ "${ID:-}" != "ubuntu" ]; then
+  fail "This script is intended for Ubuntu. Detected ID=${ID:-unknown}."
+fi
 
-# Determine docker repo family and validate
-REPO_FAMILY=""
-case "$DIST_ID" in
-  ubuntu) REPO_FAMILY="ubuntu" ;;
-  debian) REPO_FAMILY="debian" ;;
-  *)
-    if [[ "$DIST_LIKE" == *ubuntu* ]]; then
-      REPO_FAMILY="ubuntu"
-    elif [[ "$DIST_LIKE" == *debian* ]]; then
-      REPO_FAMILY="debian"
-    fi
-    ;;
-esac
+# Parse args
+TARGET_USER=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user)
+      shift
+      TARGET_USER="${1:-}"
+      [ -n "$TARGET_USER" ] || fail "Missing value for --user"
+      ;;
+    *)
+      fail "Unknown argument: $1"
+      ;;
+  esac
+  shift
+done
 
-if [[ -z "$REPO_FAMILY" ]]; then
-  if [[ "$FORCE" -eq 1 ]]; then
-    err "Unknown distro. Proceeding due to --force. Defaulting to debian family."
-    REPO_FAMILY="debian"
+# Determine target user
+if [ -z "$TARGET_USER" ]; then
+  if [ "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    TARGET_USER="$SUDO_USER"
   else
-    err "Unsupported distribution. Detected ID='${DIST_ID:-unknown}', ID_LIKE='${DIST_LIKE:-unknown}'. Use --force to override."
-    exit 1
+    # Fallback to current user
+    TARGET_USER="$(id -un)"
   fi
 fi
 
-# Determine codename if missing
-if [[ -z "$CODENAME" ]]; then
-  if have lsb_release; then
-    CODENAME="$(lsb_release -cs || true)"
-  fi
+# Ensure we run as root
+if [ "$(id -u)" -ne 0 ]; then
+  log "Re-executing with sudo..."
+  exec sudo -E bash "$0" --user "$TARGET_USER"
 fi
-if [[ -z "$CODENAME" ]]; then
-  err "Could not determine distro codename. Set VERSION_CODENAME or install lsb-release. You can run with --force but repo may be wrong."
-  exit 1
-fi
+
+log "Detected Ubuntu ${VERSION:-unknown} (${VERSION_CODENAME:-unknown})"
+log "Target user for docker group: $TARGET_USER"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# Update and prerequisites
-log "Updating package lists"
-$SUDO apt-get update -y -qq
+# Base packages
+log "Installing prerequisites..."
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg lsb-release
 
-log "Installing prerequisites: ca-certificates curl gnupg lsb-release"
-$SUDO apt-get install -y -qq ca-certificates curl gnupg lsb-release
+# Docker apt repository
+log "Configuring Docker apt repository..."
+install -m 0755 -d /etc/apt/keyrings
+if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+fi
+chmod a+r /etc/apt/keyrings/docker.gpg
 
-# Add Docker GPG key
-log "Adding Docker GPG key"
-$SUDO install -m 0755 -d /etc/apt/keyrings
-curl -fsSL "https://download.docker.com/linux/${REPO_FAMILY}/gpg" | $SUDO tee /etc/apt/keyrings/docker.asc >/dev/null
-$SUDO chmod a+r /etc/apt/keyrings/docker.asc
+ARCH="$(dpkg --print-architecture)"
+CODENAME="${VERSION_CODENAME:?}"
+echo \
+  "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${CODENAME} stable" \
+  > /etc/apt/sources.list.d/docker.list
 
-# Add Docker repository
-log "Configuring Docker APT repository for ${REPO_FAMILY} ${CODENAME} (${ARCH})"
-echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${REPO_FAMILY} ${CODENAME} stable" | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+# Install Docker Engine and plugins
+log "Installing Docker Engine and Compose plugin..."
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Update and install
-log "Refreshing package lists after adding Docker repo"
-$SUDO apt-get update -y -qq
-
-log "Installing Docker Engine, CLI, containerd, buildx and compose plugin"
-$SUDO apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-# Enable and start service
-if have systemctl; then
-  if [[ "$NO_ENABLE" -ne 1 ]]; then
-    log "Enabling docker service"
-    $SUDO systemctl enable docker
-  else
-    log "Skipping enable due to --no-enable"
-  fi
-
-  if [[ "$NO_START" -ne 1 ]]; then
-    log "Starting docker service"
-    $SUDO systemctl start docker || true
-  else
-    log "Skipping start due to --no-start"
-  fi
+# Enable and start Docker if systemd is present
+if command -v systemctl >/dev/null 2>&1; then
+  log "Enabling and starting Docker service..."
+  systemctl enable docker
+  systemctl start docker
 else
-  log "systemctl not found. Skipping enable and start."
+  log "systemctl not found. Skipping service enable and start."
 fi
 
-# Post install check
-if have docker; then
-  DOCKER_VERSION="$(docker --version 2>/dev/null || true)"
-  log "Docker installed: ${DOCKER_VERSION}"
-else
-  err "Docker command not found after installation."
-  exit 1
-fi
-
-# Optional group add
-if [[ -n "$ADD_USER" ]]; then
-  if id -u "$ADD_USER" >/dev/null 2>&1; then
-    log "Adding user '${ADD_USER}' to docker group"
-    $SUDO usermod -aG docker "$ADD_USER"
-    log "User '${ADD_USER}' added. They must re login or run: newgrp docker"
-  else
-    err "User '${ADD_USER}' does not exist. Skipping group addition."
-  fi
-else
-  cat <<EOF
-[+] Optional: add your user to the docker group to run without sudo
-    sudo usermod -aG docker \$USER
-    newgrp docker
+# Provide docker-compose v2 convenience shim so docker-compose works
+if ! command -v docker-compose >/dev/null 2>&1; then
+  log "Creating docker-compose v2 shim at /usr/local/bin/docker-compose..."
+  cat >/usr/local/bin/docker-compose <<'EOF'
+#!/usr/bin/env bash
+set -e
+exec docker compose "$@"
 EOF
+  chmod +x /usr/local/bin/docker-compose
 fi
 
-log "Done."
+# Create docker group if missing and add target user
+if ! getent group docker >/dev/null 2>&1; then
+  log "Creating docker group..."
+  groupadd docker
+fi
+
+log "Adding user ${TARGET_USER} to docker group..."
+usermod -aG docker "$TARGET_USER"
+
+# Try to activate group membership for the current shell when appropriate
+CURRENT_USER="${SUDO_USER:-$(id -un)}"
+if [ "$TARGET_USER" = "$CURRENT_USER" ]; then
+  if command -v newgrp >/dev/null 2>&1; then
+    log "Attempting to activate new group in this session..."
+    # newgrp starts a subshell. Run a no-op to verify and exit immediately.
+    su -s /bin/bash -c 'newgrp docker <<NGDONE
+true
+NGDONE
+' "$TARGET_USER" >/dev/null 2>&1 || true
+  fi
+fi
+
+# Test installations
+log "Verifying Docker installation..."
+if ! docker --version >/dev/null 2>&1; then
+  fail "docker command not found after installation."
+fi
+docker --version
+
+log "Verifying Compose installation..."
+if ! docker compose version >/dev/null 2>&1; then
+  fail "Docker Compose plugin not found."
+fi
+docker compose version
+
+log "All done."
+log "User ${TARGET_USER} has been added to the docker group."
+log "If docker commands still require sudo, log out and back in to refresh group membership."
